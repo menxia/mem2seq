@@ -172,3 +172,309 @@ class Mem2Seq(nn.Module):
         else:
             self.encoder = EncoderMemNN(lang.n_words, hidden_size, n_layers, self.dropout, self.unk_mask)
             self.decoder = DecoderrMemNN(lang.n_words, hidden_size, n_layers, self.dropout, self.unk_mask)
+
+        self.encoder_optimizer = optim.Adam(self.encoder.parameters(), lr=lr)
+        self.decoder_optimizer = optim.Adam(self.decoder.parameters(), lr=lr)
+        self.scheduler = lr_scheduler.ReduceLROnPlateau(self.decoder_optimizer,mode='max',factor=0.5,patience=1,min_lr=0.0001, verbose=True)
+        self.criterion = nn.MSELoss()
+        self.loss = 0
+        self.loss_ptr = 0
+        self.loss_vac = 0
+        self.print_every = 1
+        self.batch_size = 0
+
+        if USE_CUDA:
+            self.encoder.cuda()
+            self.decoder.cuda()
+
+    def print_loss(self):
+        print_loss_avg = self.loss / self.print_every
+        print_loss_ptr = self.loss_ptr / self.print_every
+        print_loss_vac = self.loss_vac / self.print_every
+        self.print_every += 1
+        return 'L:{:.2f}, VL:{:.2f}, PL:{:.2f}'.format(print_loss_avg,print_loss_vac,print_loss_ptr)
+
+    def save_model(self, dec_type):
+        name_data = "KVR/" if self.task=='' else "BABI/"
+        directory = 'save/mem2seq-'+name_data+str(self.task)+'HDD'+str(self.hidden_size)+'BSZ'+str(args['batch'])+'DR'+str(self.dropout)+'L'+str(self.n_layers)+'lr'+str(self.lr)+str(dec_type)                 
+        if not os.path.exists(directory):
+            os.makedirs(directory)
+        torch.save(self.encoder, directory+'/enc.th')
+        torch.save(self.decoder, directory+'/dec.th')
+
+    def train_batch(self, input_batches, input_lengths, target_batches, 
+                    target_lengths, target_index, target_gate, batch_size, clip,
+                    teacher_forcing_ratio, conv_seqs, conv_lengths, reset): 
+        if reset:
+            self.loss = 0
+            self.loss_ptr = 0
+            self.loss_vac = 0
+            self.print_every = 1
+
+        self.batch_size = batch_size
+        self.encoder_optimizer.zero_grad()
+        self.decoder_optimizer.zero_grad()
+        loss_Vocab, loss_Ptr = 0, 0
+
+        decoder_hidden = self.encoder(input_batches).unsqueeze(0)
+        self.decoder.load_memory(input_batches.transpose(0, 1))
+
+        # prepare input and output variables
+        decoder_input = Variable(torch.LongTensor([SOS_token]*batch_size))
+
+        max_target_length = max(target_lengths)
+        all_decoder_outputs_vocab = Variable(torch.zeros(max_target_length, batch_size, self.output_size))
+        all_decoder_outputs_ptr = Variable(torch.zeros(max_target_length, batch_size, input_batches.size(0)))
+
+        if USE_CUDA:
+            all_decoder_outputs_vocab = all_decoder_outputs_vocab.cuda()
+            all_decoder_outputs_ptr = all_decoder_outputs_ptr.cuda()
+            decoder_input = decoder_input.cuda()
+
+        # Choose whether to use teacher forcing
+        use_teacher_forcing = random.random() < teacher_forcing_ratio
+
+        if use_teacher_forcing:
+            for t in range(max_target_length):
+                decoder_ptr, decoder_vocab, decoder_hidden = self.decoder.ptrMemoryDecoder(decoder_input, decoder_hidden)
+                all_decoder_outputs_vocab[t] = decoder_vocab
+                all_decoder_outputs_ptr[t] = decoder_ptr
+                decoder_input = target_batches[t]# Chosen word is next input
+                if USE_CUDA: decoder_input = decoder_input.cuda()            
+        else:
+            for t in range(max_target_length):
+                decoder_ptr, decoder_vacab, decoder_hidden = self.decoder.ptrMemDecoder(decoder_input, decoder_hidden)
+                _, toppi = decoder_ptr.data.topk(1)
+                _, topvi = decoder_vacab.data.topk(1)
+                all_decoder_outputs_vocab[t] = decoder_vacab
+                all_decoder_outputs_ptr[t] = decoder_ptr
+                ## get the correspective word in input
+                top_ptr_i = torch.gather(input_batches[:,:,0],0,Variable(toppi.view(1, -1)))
+                next_in = [top_ptr_i.squeeze()[i].data[0] if(toppi.squeeze()[i] < input_lengths[i]-1) else topvi.squeeze()[i] for i in range(batch_size)]
+                decoder_input = Variable(torch.LongTensor(next_in)) # Chosen word is next input
+                if USE_CUDA: decoder_input = decoder_input.cuda()
+
+        loss_Vocab = masked_cross_entropy(
+            all_decoder_outputs_vocab.transpose(0, 1).contiguous(), # -> batch x seq
+            target_batches.transpose(0, 1).contiguous(), # -> batch x seq
+            target_lengths
+        )
+        loss_Ptr = masked_cross_entropy(
+            all_decoder_outputs_ptr.transpose(0, 1).contiguous(), # -> batch x seq
+            target_index.transpose(0, 1).contiguous(), # -> batch x seq
+            target_lengths
+        )
+
+        loss = loss_Vocab + loss_Ptr
+        loss.backward()
+        
+        # Clip gradient norms
+        ec = torch.nn.utils.clip_grad_norm(self.encoder.parameters(), clip)
+        dc = torch.nn.utils.clip_grad_norm(self.decoder.parameters(), clip)
+        # Update parameters with optimizers
+        self.encoder_optimizer.step()
+        self.decoder_optimizer.step()
+        self.loss += loss.data[0]
+        self.loss_ptr += loss_Ptr.data[0]
+        self.loss_vac += loss_Vocab.data[0]
+        
+    def evaluate_batch(self,batch_size,input_batches, input_lengths, target_batches, target_lengths, target_index,target_gate,src_plain, conv_seqs, conv_lengths):  
+        # Set to not-training mode to disable dropout
+        self.encoder.train(False)
+        self.decoder.train(False)  
+        # Run words through encoder
+        decoder_hidden = self.encoder(input_batches).unsqueeze(0)
+        self.decoder.load_memory(input_batches.transpose(0,1))
+
+        # Prepare input and output variables
+        decoder_input = Variable(torch.LongTensor([SOS_token] * batch_size))
+
+        decoded_words = []
+        all_decoder_outputs_vocab = Variable(torch.zeros(self.max_r, batch_size, self.output_size))
+        all_decoder_outputs_ptr = Variable(torch.zeros(self.max_r, batch_size, input_batches.size(0)))
+        #all_decoder_outputs_gate = Variable(torch.zeros(self.max_r, batch_size))
+        # Move new Variables to CUDA
+
+        if USE_CUDA:
+            all_decoder_outputs_vocab = all_decoder_outputs_vocab.cuda()
+            all_decoder_outputs_ptr = all_decoder_outputs_ptr.cuda()
+            #all_decoder_outputs_gate = all_decoder_outputs_gate.cuda()
+            decoder_input = decoder_input.cuda()
+        
+        p = []
+        for elm in src_plain:
+            elm_temp = [ word_triple[0] for word_triple in elm ]
+            p.append(elm_temp) 
+        
+        self.from_whichs = []
+        acc_gate,acc_ptr,acc_vac = 0.0, 0.0, 0.0
+        # Run through decoder one time step at a time
+        for t in range(self.max_r):
+            decoder_ptr,decoder_vacab, decoder_hidden = self.decoder.ptrMemDecoder(decoder_input, decoder_hidden)
+            all_decoder_outputs_vocab[t] = decoder_vacab
+            topv, topvi = decoder_vacab.data.topk(1)
+            all_decoder_outputs_ptr[t] = decoder_ptr
+            topp, toppi = decoder_ptr.data.topk(1)
+            top_ptr_i = torch.gather(input_batches[:,:,0],0,Variable(toppi.view(1, -1)))    
+            next_in = [top_ptr_i.squeeze()[i].data[0] if(toppi.squeeze()[i] < input_lengths[i]-1) else topvi.squeeze()[i] for i in range(batch_size)]
+
+            decoder_input = Variable(torch.LongTensor(next_in)) # Chosen word is next input
+            if USE_CUDA: decoder_input = decoder_input.cuda()
+
+            temp = []
+            from_which = []
+            for i in range(batch_size):
+                if(toppi.squeeze()[i] < len(p[i])-1 ):
+                    temp.append(p[i][toppi.squeeze()[i]])
+                    from_which.append('p')
+                else:
+                    ind = topvi.squeeze()[i]
+                    if ind == EOS_token:
+                        temp.append('<EOS>')
+                    else:
+                        temp.append(self.lang.index2word[ind])
+                    from_which.append('v')
+            decoded_words.append(temp)
+            self.from_whichs.append(from_which)
+        self.from_whichs = np.array(self.from_whichs)
+
+        # indices = torch.LongTensor(range(target_gate.size(0)))
+        # if USE_CUDA: indices = indices.cuda()
+
+        # ## acc pointer
+        # y_ptr_hat = all_decoder_outputs_ptr.topk(1)[1].squeeze()
+        # y_ptr_hat = torch.index_select(y_ptr_hat, 0, indices)
+        # y_ptr = target_index       
+        # acc_ptr = y_ptr.eq(y_ptr_hat).sum()
+        # acc_ptr = acc_ptr.data[0]/(y_ptr_hat.size(0)*y_ptr_hat.size(1))
+        # ## acc vocab
+        # y_vac_hat = all_decoder_outputs_vocab.topk(1)[1].squeeze()
+        # y_vac_hat = torch.index_select(y_vac_hat, 0, indices)        
+        # y_vac = target_batches       
+        # acc_vac = y_vac.eq(y_vac_hat).sum()
+        # acc_vac = acc_vac.data[0]/(y_vac_hat.size(0)*y_vac_hat.size(1))
+
+        # Set back to training mode
+        self.encoder.train(True)
+        self.decoder.train(True)
+        return decoded_words #, acc_ptr, acc_vac
+
+
+    def evaluate(self,dev,avg_best,BLEU=False):
+        logging.info("STARTING EVALUATION")
+        acc_avg = 0.0
+        wer_avg = 0.0
+        bleu_avg = 0.0
+        acc_P = 0.0
+        acc_V = 0.0
+        microF1_PRED,microF1_PRED_cal,microF1_PRED_nav,microF1_PRED_wet = [],[],[],[]
+        microF1_TRUE,microF1_TRUE_cal,microF1_TRUE_nav,microF1_TRUE_wet = [],[],[],[]
+        ref = []
+        hyp = []
+        ref_s = ""
+        hyp_s = ""
+        dialog_acc_dict = {}
+        pbar = tqdm(enumerate(dev),total=len(dev))
+        for j, data_dev in pbar: 
+            if args['dataset']=='kvr':
+                words = self.evaluate_batch(len(data_dev[1]),data_dev[0],data_dev[1],
+                                    data_dev[2],data_dev[3],data_dev[4],data_dev[5],data_dev[6], data_dev[-2], data_dev[-1]) 
+            else:
+                words = self.evaluate_batch(len(data_dev[1]),data_dev[0],data_dev[1],
+                        data_dev[2],data_dev[3],data_dev[4],data_dev[5],data_dev[6], data_dev[-4], data_dev[-3])          
+            # acc_P += acc_ptr
+            # acc_V += acc_vac
+            acc=0
+            w = 0 
+            temp_gen = []
+
+            for i, row in enumerate(np.transpose(words)):
+                st = ''
+                for e in row:
+                    if e== '<EOS>': break
+                    else: st+= e + ' '
+                temp_gen.append(st)
+                correct = data_dev[7][i]  
+                ### compute F1 SCORE  
+                if args['dataset']=='kvr':
+                    f1_true,f1_pred = computeF1(data_dev[8][i],st.lstrip().rstrip(),correct.lstrip().rstrip())
+                    microF1_TRUE += f1_true
+                    microF1_PRED += f1_pred
+                    f1_true,f1_pred = computeF1(data_dev[9][i],st.lstrip().rstrip(),correct.lstrip().rstrip())
+                    microF1_TRUE_cal += f1_true
+                    microF1_PRED_cal += f1_pred 
+                    f1_true,f1_pred = computeF1(data_dev[10][i],st.lstrip().rstrip(),correct.lstrip().rstrip())
+                    microF1_TRUE_nav += f1_true
+                    microF1_PRED_nav += f1_pred 
+                    f1_true,f1_pred = computeF1(data_dev[11][i],st.lstrip().rstrip(),correct.lstrip().rstrip()) 
+                    microF1_TRUE_wet += f1_true
+                    microF1_PRED_wet += f1_pred  
+                elif args['dataset']=='babi' and int(self.task)==6:
+                    f1_true,f1_pred = computeF1(data_dev[-2][i],st.lstrip().rstrip(),correct.lstrip().rstrip())
+                    microF1_TRUE += f1_true
+                    microF1_PRED += f1_pred
+
+                if args['dataset']=='babi':
+                    if data_dev[-1][i] not in dialog_acc_dict.keys():
+                        dialog_acc_dict[data_dev[-1][i]] = []
+                    if (correct.lstrip().rstrip() == st.lstrip().rstrip()):
+                        acc+=1
+                        dialog_acc_dict[data_dev[-1][i]].append(1)
+                    else:
+                        dialog_acc_dict[data_dev[-1][i]].append(0)
+                else:
+                    if (correct.lstrip().rstrip() == st.lstrip().rstrip()):
+                        acc+=1
+                #    print("Correct:"+str(correct.lstrip().rstrip()))
+                #    print("\tPredict:"+str(st.lstrip().rstrip()))
+                #    print("\tFrom:"+str(self.from_whichs[:,i]))
+
+                w += wer(correct.lstrip().rstrip(),st.lstrip().rstrip())
+                ref.append(str(correct.lstrip().rstrip()))
+                hyp.append(str(st.lstrip().rstrip()))
+                ref_s+=str(correct.lstrip().rstrip())+ "\n"
+                hyp_s+=str(st.lstrip().rstrip()) + "\n"
+
+            acc_avg += acc/float(len(data_dev[1]))
+            wer_avg += w/float(len(data_dev[1]))            
+            pbar.set_description("R:{:.4f},W:{:.4f}".format(acc_avg/float(len(dev)),
+                                                                    wer_avg/float(len(dev))))
+
+        # dialog accuracy
+        if args['dataset']=='babi':
+            dia_acc = 0
+            for k in dialog_acc_dict.keys():
+                if len(dialog_acc_dict[k])==sum(dialog_acc_dict[k]):
+                    dia_acc += 1
+            logging.info("Dialog Accuracy:\t"+str(dia_acc*1.0/len(dialog_acc_dict.keys())))
+
+        if args['dataset']=='kvr':
+            logging.info("F1 SCORE:\t"+str(f1_score(microF1_TRUE, microF1_PRED, average='micro')))
+            logging.info("F1 CAL:\t"+str(f1_score(microF1_TRUE_cal, microF1_PRED_cal, average='micro')))
+            logging.info("F1 WET:\t"+str(f1_score(microF1_TRUE_wet, microF1_PRED_wet, average='micro')))
+            logging.info("F1 NAV:\t"+str(f1_score(microF1_TRUE_nav, microF1_PRED_nav, average='micro')))
+        elif args['dataset']=='babi' and int(self.task)==6 :
+            logging.info("F1 SCORE:\t"+str(f1_score(microF1_TRUE, microF1_PRED, average='micro')))
+
+              
+        bleu_score = moses_multi_bleu(np.array(hyp), np.array(ref), lowercase=True) 
+        logging.info("BLEU SCORE:"+str(bleu_score))     
+        if (BLEU):                                                               
+            if (bleu_score >= avg_best):
+                self.save_model(str(self.name)+str(bleu_score))
+                logging.info("MODEL SAVED")  
+            return bleu_score
+        else:
+            acc_avg = acc_avg/float(len(dev))
+            if (acc_avg >= avg_best):
+                self.save_model(str(self.name)+str(acc_avg))
+                logging.info("MODEL SAVED")
+            return acc_avg
+
+def computeF1(entity,st,correct):
+    y_pred = [0 for z in range(len(entity))]
+    y_true = [1 for z in range(len(entity))]
+    for k in st.lstrip().rstrip().split(' '):
+        if (k in entity):
+            y_pred[entity.index(k)] = 1
+    return y_true,y_pred
